@@ -1,0 +1,189 @@
+box:
+    id: bluezd/zephyr-glassfish-base
+    tag: latest
+    registry: https://registry.hub.docker.com
+
+build:
+  steps:
+    - script:
+        name: copy files
+        code: |
+              mv /glassfish4 /pipeline/source/
+    - script:
+        name: check
+        code: |
+            pwd
+            ls -l
+            ls -l /
+            env
+            echo $PATH
+            jq --version
+deploy:
+  steps:
+    - internal/docker-push:
+        username: $DOCKER_USERNAME
+        password: $DOCKER_PASSWORD
+        tag: $WERCKER_MAIN_PIPELINE_STARTED
+        #tag: wercker
+        repository: $DOCKER_REGISTRY/$APP_NAME
+        registry: https://registry.hub.docker.com
+    - script:
+        name: deploy
+        code: |
+                set -ex
+
+                function verify_deployments()
+                {
+                   TRY=0
+                   MAX_TRIES=15
+                   WAIT_SECONDS=10
+                   HEALTHY=0
+                   while [ $TRY -lt $MAX_TRIES ];
+                   do
+                      TRY=$(( $TRY + 1 ))
+                      RESPONSE=$(curl -ks -XGET -H "Authorization: Bearer ${API_TOKEN}" ${SERVICE_MANAGER}/api/v2/deployments/${1}-${2} | recode html..ascii | jq ".deployment | .current_state == .desired_state")
+
+                      if [ "$RESPONSE" == "true" ]; then
+                          HEALTHY=1
+                          break
+                      fi
+                      echo "== Current and desired state of deployment do not match. ${TRY} of ${MAX_TRIES} tries. =="
+                      sleep $WAIT_SECONDS
+                   done
+
+                   if [ $HEALTHY -gt 0 ]; then
+                       echo "== Current and desired state of deployment match. success. =="
+                   else
+                       echo "!! Tried ${MAX_TRIES} times but deployment is not healthy. !!"
+                       exit 1
+                   fi
+                }
+
+                # ------------------------------------
+                # Step 1: Remove the Deployments
+                # ------------------------------------
+                deploy_ids=$(curl -sk -X "GET" -H "Authorization: Bearer ${API_TOKEN}" "${SERVICE_MANAGER}/api/v2/deployments/" | jq ".deployments"[]".deployment_id" | tr -d '"')
+                for deployID in $deploy_ids; do
+                   prefix=`echo $deployID | awk -F"-" '{ print $1}'`
+                   if [[ $prefix == "postgres" ]] || [[ $prefix == "zephyr" ]]; then
+                      # verify deployment exist or not
+                      HTTP_CODE=$(curl -ks -XGET -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${API_TOKEN}" ${SERVICE_MANAGER}/api/v2/deployments/${deployID})
+                      if [ $HTTP_CODE -eq 404 ]; then
+                          continue
+                      else
+                         # First, the deployment must be stopped;
+                         echo "## Stop $deployID ##"
+                         curl -ks -XPOST -H "Authorization: Bearer ${API_TOKEN}" ${SERVICE_MANAGER}/api/v2/deployments/${deployID}/stop
+
+                         # Make sure it has stopped
+                         TRY=0
+                         MAX_TRIES=30
+                         WAIT_SECONDS=10
+                         STOPPED=0
+                         while [ $TRY -lt $MAX_TRIES ]; do
+                                 TRY=$(( $TRY + 1 ))
+                                 RESPONSE=$(curl -ks -XGET -H "Authorization: Bearer ${API_TOKEN}" ${SERVICE_MANAGER}/api/v2/deployments/${deployID} | recode html..ascii | jq ".deployment | .current_state == .desired_state")
+
+                                 if [ "$RESPONSE" == "true" ]; then
+                                         STOPPED=1
+                                         break
+                                 fi
+                                 echo "Current and desired state of deployment do not match. ${TRY} of ${MAX_TRIES} tries."
+                                 sleep $WAIT_SECONDS
+                         done
+
+                         if [ $STOPPED -gt 0 ]; then
+                                 # Finally, remove the deployment, and reset the ID
+                                 echo "## Original deployment has stopped. Removing the deployment for ${deployID}."
+
+                                 TRY=0
+                                 MAX_TRIES=30
+                                 WAIT_SECONDS=10
+                                 REMOVED=0
+                                 while [ $TRY -lt $MAX_TRIES ]; do
+                                         TRY=$(( $TRY + 1 ))
+                                         RESPONSE=$(curl -k -s -XDELETE -H "Authorization: Bearer ${API_TOKEN}" ${SERVICE_MANAGER}/api/v2/deployments/${deployID})
+                                         ERROR_COUNT=$(echo ${RESPONSE} | recode html..ascii | jq -r ".errors | length")
+
+                                         if [ $ERROR_COUNT -gt 0 ]; then
+                                         ERRORS=$(echo ${RESPONSE} | recode html..ascii | jq ".errors[].message")
+                                                 echo "${TRY} of ${MAX_TRIES} removal tries. ${ERRORS}"
+                                         else
+                                                 REMOVED=1
+                                                 break
+                                         fi
+                                         sleep $WAIT_SECONDS
+                                 done
+
+                                 if [ $REMOVED -gt 0 ]; then
+                                         echo "## Deployment ${deployID} has been removed. ##"
+                                 else
+                                         echo "## Checked ${MAX_TRIES} times but ${deployID} is not removed. You may need to remove it manually. ##"
+                                 fi
+                         else
+                                 echo "Checked ${MAX_TRIES} times but deployment is not stopped. You may need to stop it manually."
+                         fi
+                      fi
+                   fi
+                done
+
+                # ------------------------------------
+                # Step 2: Deploy postgres db
+                # ------------------------------------
+                TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+                POSTDATA=$(cat <<ENDOFTEMPLATE
+                {
+                  "deployment_id": "postgres-${TIMESTAMP}",
+                  "deployment_name": "postgres",
+                  "desired_state": 1,
+                  "placement": {
+                    "pool_id": "default"
+                  },
+                  "quantities": {
+                    "postgres": 1
+                  },
+                  "stack": {
+                    "service_id": "postgres",
+                    "service_name": "postgres",
+                    "subtype": "service",
+                    "content": "version: 2\nservices:\n  postgres:\n    image: \"postgres:latest\"\n    container_name: postgres\n    environment:\n      - POSTGRES_PASSWORD=oracle\n      - 'occs:scheduler=random'\n      - 'occs:description=postgres'\n    ports:\n      - '5432:5432/tcp'\n"
+                  }
+                }
+                ENDOFTEMPLATE
+                )
+                echo "## starting deploy postgres db ##"
+                curl -k -XPOST -H "Authorization: Bearer ${API_TOKEN}" -d "${POSTDATA}" ${SERVICE_MANAGER}/api/v2/deployments/
+
+                verify_deployments "postgres" $TIMESTAMP
+
+                # ------------------------------------
+                # Step 3: Deploy zephyr-glassfish
+                # ------------------------------------
+                TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+                POSTDATA=$(cat <<ENDOFTEMPLATE
+                {
+                  "deployment_id": "zephyr-glassfish-${TIMESTAMP}",
+                  "deployment_name": "zephyr-glassfish ${WERCKER_MAIN_PIPELINE_STARTED}",
+                  "desired_state": 1,
+                  "placement": {
+                    "pool_id": "default"
+                  },
+                  "quantities": {
+                    "zephyr-glassfish": 1
+                  },
+                  "stack": {
+                    "service_id": "zephyr-glassfish",
+                    "service_name": "zephyr-glassfish",
+                    "subtype": "service",
+                    "content": "version: 2\nservices:\n  zephyr-glassfish:\n    image: \"$DOCKER_REGISTRY/$APP_NAME:${WERCKER_MAIN_PIPELINE_STARTED}\"\n    environment:\n      - 'occs:scheduler=random'\n    ports:\n      - '80:8080/tcp'\n      - '4848:4848/tcp'\n      - '8181:8181/tcp'\n    links:\n      - 'postgres:postgresDBAddr'\n    command: ${DOCKER_CMD}\n"
+                  }
+                }
+                ENDOFTEMPLATE
+                )
+
+                echo "## starting deploy zephyr-glassfish app ##"
+                curl -k -XPOST -H "Authorization: Bearer ${API_TOKEN}" -d "${POSTDATA}" ${SERVICE_MANAGER}/api/v2/deployments/
+
+                verify_deployments "zephyr-glassfish" $TIMESTAMP
